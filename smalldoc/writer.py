@@ -25,6 +25,6 @@ def write(module: dict) -> str:
     :return: A single page markdown representation of your documentation
     :rtype str
     """
-    with open('smalldoc/onepage.md.jinja', 'r') as template_file:
+    with open('smalldoc/onepage.md.jinja', 'r', encoding='utf-8') as template_file:
         template = Template(template_file.read())
         return template.render(module=module)

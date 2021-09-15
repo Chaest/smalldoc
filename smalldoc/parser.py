@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def parse(working_path: str, module_name: str, show_private=False) -> dict:
     """
-    Parse your code and  docstring then generate a dict with it.
+    Parse your code and docstring then generate a dict with it.
     :param working_path: The working directory to fetch your module
     :param module_name: The name of the module you want to generate dict of your documentation
     :param show_private: If True, parser will navigate through your private methode. At False by default.
@@ -38,89 +38,119 @@ def parse(working_path: str, module_name: str, show_private=False) -> dict:
     sys.path.append(working_path)
     try:
         mod = pydoc.safeimport(module_name)
-        if mod is not None:
-            return _parse_module(mod)
-    except pydoc.ErrorDuringImport as e:
-        logger.error(f'Error while trying to load module {module_name}: {e}')
-        raise e
+        return _parse_module(mod, show_private) if mod is not None else None
+    except pydoc.ErrorDuringImport as err:
+        logger.error(f'Error while trying to load module {module_name}: {err}')
+        raise pydoc.ErrorDuringImport from err
 
 
 def _is_valid_module_name(module_name):
-    return not module_name.startswith('.') \
-           and not module_name.startswith('__')
+    return not module_name.startswith(('.', '__'))
 
 
-def _get_sorted_value(item: dict) -> str:
-    return item.get('name')
+def _sorted_by_name(items: list) -> list:
+    return sorted(items, key=lambda item: item['name'])
+
+
+def _is_to_be_shown(module_name: str, show_private: bool) -> bool:
+    return not show_private and not module_name.startswith('_')
+
+
+def _is_valid_sub_module(module_path: str, sub_module_path: str) -> bool:
+    full_path = f'{module_path}/{sub_module_path}'
+    return all((
+        isdir(full_path),
+        _is_valid_module_name(sub_module_path),
+        exists(f'{full_path}/__init__.py')
+    ))
+
+
+def _get_valid_sub_modules(module_path: str) -> list:
+    return [
+        sub_module_path
+        for sub_module_path in os.listdir(module_path)
+        if _is_valid_sub_module(module_path, sub_module_path)
+    ]
 
 
 def _parse_module(module, show_private=False) -> dict:
-    res = {
-        'name': module.__name__,
-        'description': _remove_first_and_last_newline(module.__doc__)
-    }
-
-    functions = [_parse_function(function) for function in inspect.getmembers(module, inspect.isfunction)
-                 if not show_private and not function[0].startswith('_')]
-    functions.sort(key=_get_sorted_value)
-    res['functions'] = functions
-    classes = [_parse_class(classe, show_private) for classe in inspect.getmembers(module, inspect.isclass)
-               if not show_private and not classe[0].startswith('_')]
-    classes.sort(key=_get_sorted_value)
-    res['classes'] = classes
-
-    modules = []
     module_path = os.path.dirname(os.path.abspath(module.__file__))
-    for sub_module_path in [current_dir for current_dir in os.listdir(module_path) if
-                            isdir(f'{module_path}/{current_dir}')
-                            and _is_valid_module_name(current_dir)
-                            and exists(f'{module_path}/{current_dir}/__init__.py')
-                            ]:
-        sub_module_name = f'{module.__name__}.{sub_module_path}'
-        abs_sub_module_path = f'{module_path}/{sub_module_path}'
-        sys.path.append(abs_sub_module_path)
-        sub_mod = pydoc.safeimport(sub_module_name)
-        modules.append(_parse_module(sub_mod))
-    modules.sort(key=_get_sorted_value)
-    res['modules'] = modules
-    return res
+    sub_modules = _get_valid_sub_modules(module_path)
+
+    for sub_module_path in sub_modules:
+        sys.path.append(f'{module_path}/{sub_module_path}')
+
+    return {
+        'name': module.__name__,
+        'description': module.__doc__.strip(),
+        'functions': _sorted_by_name([
+            _parse_function(function)
+            for function in inspect.getmembers(module, inspect.isfunction)
+            if _is_to_be_shown(function[0], show_private)
+        ]),
+        'classes': _sorted_by_name([
+            _parse_class(classe, show_private)
+            for classe in inspect.getmembers(module, inspect.isclass)
+            if _is_to_be_shown(classe[0], show_private)
+        ]),
+        'modules': _sorted_by_name([
+            _parse_module(pydoc.safeimport(f'{module.__name__}.{sub_module_path}'))
+            for sub_module_path in sub_modules
+        ])
+    }
 
 
 def _parse_class(class_to_parse, show_private=False) -> dict:
     classe = class_to_parse[1]
     doc = inspect.getdoc(classe)
-    nested_classes = [_parse_class(nested) for nested in inspect.getmembers(classe, inspect.isclass)
-                      if nested[0] != "__class__" and not show_private and not nested[0].startswith('_')]
-    nested_classes.sort(key=_get_sorted_value)
-    functions = [_parse_function(function) for function in inspect.getmembers(classe, inspect.isfunction)
-                 if not show_private and not function[0].startswith('_')]
-    functions.sort(key=_get_sorted_value)
     return {
         'name': class_to_parse[0],
-        'doc': _remove_first_and_last_newline(doc) if doc else '',
-        'functions': functions,
-        'classes': nested_classes
+        'doc': doc.strip() if doc else '',
+        'functions': _sorted_by_name([
+            _parse_function(function)
+            for function in inspect.getmembers(classe, inspect.isfunction)
+            if _is_to_be_shown(function[0], show_private)
+        ]),
+        'classes': _sorted_by_name([
+            _parse_class(nested)
+            for nested in inspect.getmembers(classe, inspect.isclass)
+            if nested[0] != "__class__"
+            and _is_to_be_shown(nested[0], show_private)
+        ])
     }
 
 
 def _parse_function(function_to_parse) -> dict:
     function = function_to_parse[1]
-    args_spec = inspect.getfullargspec(function)
     signature = inspect.signature(function)
     doc = inspect.getdoc(function)
 
-    def arg_doc(arg: str) -> str:
-        arg_doc_res = ''
-        match = re.search(rf':param[:]?\s*{arg}[:]?\s*([^\n]*)', doc) if doc else False
-        if match:
-            arg_doc_res = match.group(1)
-        return arg_doc_res
+    return {
+        'name': function_to_parse[0],
+        'parameters': _parse_function_args(function),
+        'return': _parse_return_function(function),
+        'def': f'def {function_to_parse[0]}{signature}',
+        'doc': re.sub(r':\w.*((\n$)|$])?', '', doc) if doc else ''
+    }
 
-    arguments = [{'name': arg,
-                  'type': args_spec.annotations[arg].__name__ if arg in args_spec.annotations else '',
-                  'doc': arg_doc(arg)
-                  }
-                 for arg in args_spec.args]
+
+def _parse_function_args(function) -> list:
+    args_spec = inspect.getfullargspec(function)
+
+    docstr_args = {
+        match['param']: match['description']
+        for match in re.finditer(r':param\s*(?P<param>.*?):?\s+(?P<description>.*)', inspect.getdoc(function))
+    }
+
+    arguments = _sorted_by_name([
+        {
+            'name': arg,
+            'type': args_spec.annotations[arg].__name__ if arg in args_spec.annotations else '',
+            'doc': docstr_args.get(arg, '')
+        }
+        for arg in args_spec.args
+    ])
+
     if args_spec.varargs:
         arguments.append({
             'name': f'*{args_spec.varargs}',
@@ -134,38 +164,25 @@ def _parse_function(function_to_parse) -> dict:
             'doc': ''
         })
 
-    arguments.sort(key=_get_sorted_value)
-    return {
-        'name': function_to_parse[0],
-        'parameters': arguments,
-        'return': _parse_return_function(function_to_parse),
-        'def': f'def {function_to_parse[0]}{signature}',
-        'doc': re.sub(r':\w.*((\n$)|$])?', '', doc) if doc else ''
-    }
+    return arguments
 
 
-def _parse_return_function(function_to_parse) -> dict:
-    function = function_to_parse[1]
+def _parse_return_function(function) -> dict:
     doc = pydoc.getdoc(function)
-    signature = inspect.signature(function)
-    return_type = ''
-    return_type_class = signature.return_annotation
-    if return_type_class == inspect._empty:
-        # Extract from doc
-        match = re.search(r':rtype[:]?\s*(\w*)', doc)
-        if match:
-            return_type = match.group(1)
-    else:
-        return_type = return_type_class.__name__
-    return_doc = ''
-    match_doc = re.search(r':return[:]?\s*([^\n]*)', doc)
-    if match_doc:
-        return_doc = _remove_first_and_last_newline(match_doc.group(1))
     return {
-        'type': return_type,
-        'doc': return_doc
+        'type': _extract_from_doc('rtype', doc) if _no_annotation_return(function) else _annotation_return_type(function),
+        'doc': _extract_from_doc('return', doc)
     }
 
 
-def _remove_first_and_last_newline(a_str: str) -> str:
-    return re.sub(r'\n+$', '', re.sub(r'^\n+', '', a_str)) if a_str else ''
+def _extract_from_doc(element: str, doc: str) -> str:
+    match = re.search(rf':{element}:?\s+(.*)', doc)
+    return match.group(1).strip() if match else ''
+
+
+def _no_annotation_return(function):
+    return inspect.signature(function).return_annotation  == inspect.Signature.empty
+
+
+def _annotation_return_type(function):
+    return inspect.signature(function).return_annotation.__name__
